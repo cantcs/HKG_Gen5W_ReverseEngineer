@@ -15,9 +15,7 @@ The first page I found about hacking Hyundai HUs was an old XDA thread with some
 Most things described in this page are things I learned in this Discord Group enriched with a few contributions on my own.  
 Special thanks to Helloyunho, superdavex, UnjustifiedDev, and so many others who contributed to the group.
 
-
-If you are looking for information on D-Audio2 generation check [greenluigi](https://programmingwithstyle.com/posts/howihackedmycar/) the series of posts [How I Hacked My Car](https://programmingwithstyle.com/posts/howihackedmycar/) (source code [here](https://github.com/greenluigi1/HyundaiFirmwareDecrypter)).  For D-Audio (v1) check [xakcop](https://xakcop.com/post/hyundai-hack/). Both were still based on password-protected ZIP file. For Gen5 (not Gen5W) check [Radoslav Gerganov](https://github.com/rgerganov/gen5fw).
-
+Other important blog posts (maybe where everything started?) were [greenluigi's series of posts "How I Hacked My Car"](https://programmingwithstyle.com/posts/howihackedmycar/) for GEN5W (source code [here](https://github.com/greenluigi1/HyundaiFirmwareDecrypter) and [Radoslav Gerganov's posts](https://xakcop.com/post/hyundai-hack/) for GEN5 (source code [here](https://github.com/rgerganov/gen5fw)) - they were based on old versions where updates were still encrypted using ZIP files, but many of the concepts and findings are still valid for current GEN5/GEN5W releases. Another important reference is this [russian forum topic](https://4pda.to/forum/index.php?showtopic=951764&st=740) that explains FWDN, lk.rom, service mode, among other advanced topics.
 
 
 ## Limitations
@@ -42,44 +40,49 @@ In order to apply the methods described here you'll need:
 
 ## How Firmware Updates Works
 
-Firmware updates are basically TAR archives that can be downloaded and saved in a USB drive.
+Firmware updates are basically a bunch of TAR archives (let's call them **Top-Level TAR files**) plus some auxiliary files (integrity-checks and metadata) - they should all be saved into a USB drive and through the UI it's possible to start the update process.
 
-These tar archives contain some "core" files that are directly flashed as Android partitions:
-- `boot` partition (contains Android kernel/OS/drivers), `system` partition (filesystem/apps), `recovery` partition (code to install new firmware updates from USB drive), `lk` (bootloader / little kernel), modem firmware, micom, etc.
-- **Those partitions are all encrypted using AES-128-CBC**.
-- Example: `/enc_system/enc_boot.img` is decrypted into `boot.img` that is flashed into `/boot` partition
+Those top-level-tars are all hashed using SHA-224, and this list of filenames+hashes is saved in `NEW_TarList.txt_encrypted` (despite the name this is just a plaintext file encoded with a lame XOR cryptography where all bytes XORed with byte `0x11`). This list of files is also signed using RSA into a file `NEW_TarList.txt_encrypted.rsa` (only Hyundai has the private key, so we can't fake that signature).
+
+The most important TAR file (the one that contains images for all Android partitions) is named like `system_package_HMC.xxx.xxxx.Vxxx.xxx.xxxxxx.xxxxxx.tar`:
+- It has a subfolder `enc_system` with all encrypted images: `enc_boot.img`, `enc_system.ext4`, `enc_recovery.img`, `enc_lk.rom`, etc. 
+- **Those images are all encrypted using AES-128-CBC**.
 - The secret key is **NOT** the same for all car models
-- This key can be found in `/system/etc/image.dat` (it's the first 32 chars), after you get access to your HU
+- After you get access to your HU you can find this key as the first 32 chars of `/system/etc/image.dat`
+- After images are decrypted they are directly flashed to the respective partitions:
+  - `enc_boot.img` is decrypted into `boot.img` and flashed into `boot` partition (contains Android kernel/OS/drivers)
+  - `enc_system.ext4` is decrypted into `system.ext4` and flashed into `system` partition (filesystem/apps)
+  - `enc_recovery.img` is decrypted into `recovery.img` and flashed into `recovery` partition (code to install new firmware updates from USB drive)
+  - `enc_lk.rom` is decrypted into `lk.rom` (little kernel) and flashed into the eMMC boot area (U-Boot bootloader)
+- This TAR also contains unencrypted files like for modem firmware, micom firmware, gps firmware, and voice recognition software. <!-- Most of these are not encrypted, and they usually have invidividual routines for being copied. -->
+- This TAR also contains it's own protection against malicious tampering: `update.info` has a list of all files and the respective hashes, and `update_info` is the associated RSA-signature.  
+  So hashlists and signed-hashlists exist both for top-level tar files (as `NEW_TarList.txt_encrypted.rsa`) and also for contents of this specific tar (as `update_info`).
 
-These tar archives also contain navigation app and maps stored in other tar files (`navi_backup.tar*` and `sw_backup.tar`):
-- These files are basically just extracted on top of `/navi` partition (it's a partition only for navigation software)
+Another important top-level file is `sw_backup.tar` which contains the navigation software:
+- This file is simply extracted on top of `/navi` partition (it's a partition only for navigation software)
 - Some files in the tar are just unencrypted
 - Executable files (or libs) are encrypted using AES-128-CBC
 - The secret key is the SAME for EVERY Hyundai/Kia/Genesis car model (spoiler: it was [leaked](https://github.com/Helloyunho/gen5w-utils/blob/main/decrypt_navi.py))
-
-On top of AES encryption there's also RSA-signatures:
-- All files are hashed using SHA-224
-- A digest of all hashes is encrypted using a lame XOR cryptography
-- This digest is signed using RSA (only Hyundai has the private key, so we can't fake that signature)
-- Updater programs will check if the RSA signature is authentic (using the corresponding public key, baked into the filesystem)
-- Updater programs also checks (well, mostly) if the hashes in the signed digest are still matching the hashes of the actual files
+- PS: Maps can be found under `navi_backup.tar*` and are also extracted to `/navi`
 
 The update process starts in the UI - we enter Settings menu and click Update button:
-- Settings app communicates with `uagentd` (Update Agent Daemon), which will check USB drive, check RSA signature (both check if it's authentic and also check if the current hashes match what was signed)
-- If everything looks good it will reboot into `recovery` mode.
+- Settings app (I think it's `DMClient`) communicates with `uagentd` (Update Agent Daemon), to validate the firmware package in the USB drive, and if everything looks good it will reboot into `recovery` mode (running `init` program from `recovery` partition), which is where the important things happen
+- recovery program should validate the firmware package again, decrypt the partition images, flash them one by one, extract navigation software (decrypting the encrypted parts), navigation maps, copy modem/micom/gps files, etc.
 
-The second part of the update process happens in recovery mode (`/sbin/recovery` from `recovery` partition):
-- It will check RSA signature again (both check if it's authentic and also check if the current hashes match what was signed)
-- It will decrypt the partitions and flash them one by one
-- It will extract navigation tars (including `sw_backup.tar`) and decrypt the encrypted parts
+In a well-designed software they were supposed to be validating different things:
+- They should check if all files and respective hashes are still matching what was saved into a digest (list of hashes)
+- They should check if the RSA signature is authentic (if it was created with the private key associated to the public key, baked into the filesystem)
+- They should check if the RSA signature was applied over the same digest (list of hashes) that match the files
 
 
 ## Main Exploit: How it Works
 
-The major security flaw was discovered by [Helloyunho](https://github.com/Helloyunho/gen5w-utils) by disassembling `uagentd`/`recovery` and analyzing recovery logs:
-- `uagentd` was NOT checking the `sw_backup.tar` hash, so that file can be tampered and doesn't need to match the hash that RSA-signed (currently this was fixed but there's still a hack to bypass that)
-- `recovery` does NOT check `sw_backup.tar` hash either (still doesn't!)
-- Encrypted files in `sw_backup.tar` are decrypted with a secret key that could be retrieved from the binaries - and now it has been [leaked](https://github.com/Helloyunho/gen5w-utils/blob/main/decrypt_navi.py)
+The major security flaw was discovered by [Helloyunho](https://github.com/Helloyunho/gen5w-utils) by disassembling `uagentd`/`DMClient`/`recovery` and analyzing recovery logs:
+- Encrypted files in `sw_backup.tar` are decrypted with a secret key that could be retrieved from the binaries - and now it has been [leaked](https://github.com/Helloyunho/gen5w-utils/blob/main/decrypt_navi.py).
+- With that key it's possible to patch navigation software to run arbitrary code.
+- `DMClient`/`uagentd` were NOT checking if the RSA signature (`NEW_TarList.txt_encrypted.rsa`) was matching the signed digest (or maybe not using that signature at all?). So it was possible to tamper files (like `sw_backup.tar`) as long as we updated the new hash in `NEW_TarList.txt_encrypted`. Currently this was fixed (`getNaviValidationResult`) but there's still a hack to bypass that.
+- `recovery` was NOT checking the `NEW_TarList.txt_encrypted.rsa` RSA signature either (still doesn't!).  
+  (but I think it checks the other RSA signature `update_info` internally used in `system_package_HMC.xxx.xxxx.Vxxx.xxx.xxxxxx.xxxxxx.tar`)
 
 Then being able to decrypt/encrypt navigator libraries she created the main exploit, based on method hooking:
 - There is a [hook](https://github.com/Helloyunho/gen5w-utils/blob/main/hook.c) method that will look for a [shell script](https://github.com/Helloyunho/gen5w-utils/blob/main/run.sh) in your USB drive and will [invoke](https://github.com/Helloyunho/gen5w-utils/blob/main/hook.c#L255) it - allows you to run arbitrary code in the Android HU
@@ -120,6 +123,16 @@ After downloading an official firmware (or using an old downloaded copy, even be
     export PATH="$PATH:$HOME/libtar/libtar" # or (not persistent): PATH="$PATH:$HOME/libtar/libtar"
     ```
 
+1. Clone [Helloyunho repository](https://github.com/Helloyunho/gen5w-utils) and install dependencies:
+    ```sh
+    cd ~
+    git clone https://github.com/Helloyunho/gen5w-utils.git
+    cd ~/gen5w-utils
+    python3 -m pip install -r requirements.txt
+    ```
+
+1. If you don't want to rebuild `hook.c` and `tc-write-misc.c` on your own, you can just download them here ([hook.o](hook.o?raw=true) and [tc-write-misc](tc-write-misc?raw=true)) and skip next 3 steps.
+
 1. Download Android NDK r19:
     ```sh
     sudo mkdir /android/
@@ -129,19 +142,12 @@ After downloading an official firmware (or using an old downloaded copy, even be
     export NDK_ROOT=/android/android-ndk-r19c
     ```
 
-1. Clone [Helloyunho repository](https://github.com/Helloyunho/gen5w-utils) and install dependencies:
-    ```sh
-    cd ~
-    git clone https://github.com/Helloyunho/gen5w-utils.git
-    cd ~/gen5w-utils
-    python3 -m pip install -r requirements.txt
-    ```
-
 1. Build `hook.c` into `hook.o`:
     ```sh
+    cd ~/gen5w-utils
     ./build_hook.sh
     ```
-    The output (`hook.o`) is a binary object that will be injected (using [LIEF](https://github.com/lief-project/LIEF)) into a navigation-app library
+    The output (`hook.o`) is a binary object that will be injected (using [LIEF](https://github.com/lief-project/LIEF)) into a navigation-app library.  
 
 1. Download [tc-write-misc.c](tc-write-misc.c?raw=true) utility and build it:    
     ```sh
@@ -151,15 +157,17 @@ After downloading an official firmware (or using an old downloaded copy, even be
     "$NDK_ROOT/toolchains/llvm/prebuilt/$HOST_TAG/bin/armv7a-linux-androideabi19-clang" -mthumb -fPIC -shared -fomit-frame-pointer -nostdlib -nodefaultlibs tc-write-misc.c -o tc-write-misc
     ```
 
-1. Copy the downloaded firmware into some folder where we'll apply the patch (e.g. `/2023_Palisade_USA/`).  
-   PS: You should do all these steps in a Linux filesystem (**POSIX-compliant**), if you try to patch firmware directly under the USB drive created by Navigation Updater (which only accepts FAT/NTFTS) it probably WON'T work, and you might get a bad tarfile.  
-   PS: The only large file that you'll need is `sw_backup.tar`, so if you're copying firmware files to Linux to run the patching scripts you only have to copy this specific file and the other smaller files. After the patching process you can copy all these files (they will have been modified) back to the original place where you have all firmware files (probably an USB drive).
+1. Create a new folder in your Linux for applying the patch (e.g. `/2023_Palisade_USA/`).  
+   This can be any **POSIX-compliant** filesystem, so do NOT do this using FAT or NTFS filesystems (like your USB Drive) since you might get a bad tarfile.
 
-1. Now patch sw_backup.tar:  
+1. Copy the downloaded firmware into that folder. You can copy all files but to make things faster you can just copy `sw_backup.tar` (the only large file you'll need) and the smaller files (`*.ver`, `NEW_TarList.txt*`).
+
+1. Now apply the patch (will modify `sw_backup.tar` and `NEW_TarList.txt_encrypted`):  
   `python3 make_patched_firmware.py /2023_Palisade_USA/`  
-  This will extract `sw_backup.tar`, find the right libraries to be patched, decrypt them, patch them with the hook, reencrypt, and will recalculate `sw_backup.tar` hash. The original RSA signature is preserved (as explained earlier the hash for tampered `sw_backup.tar` is not compared with whatever hash was signed)
+  This will extract `sw_backup.tar`, find the right libraries to be patched, decrypt them, patch them with the hook, reencrypt, and will recalculate `sw_backup.tar` hash and update it in `NEW_TarList.txt_encrypted`.  
+  The original RSA signature `NEW_TarList.txt_encrypted.rsa` is preserved (as explained earlier the hash for tampered `sw_backup.tar` thankfully is not compared with whatever hash was signed)
 
-1. Copy the firmware (with the modified files) to your USB drive.  
+1. Copy the whole firmware (including the files that were just modified) to the root of your USB drive.  
    Also copy `tc-write-misc` that you built (you'll need it later)
 
 ## Flashing the Patched Firmware (if your car has firmware older than Oct 2023)
@@ -168,9 +176,9 @@ If your car has old firmware (older than Oct 2023) you can just flash the patche
 
 ## Flashing the Patched Firmware (if your car has recent firmware)
 
-In recent firmware versions (October 2023) `uagentd` was fixed to check `sw_backup.tar` hash (it should match what was signed by RSA private key). So basically a patched `sw_backup.tar` is NOT accepted anymore as valid. 
+In recent firmware versions (October 2023) `uagentd`/`DMClient` were fixed to check that the hash signed by RSA private key still matches current `sw_backup.tar` hash. So basically we can't just patch `sw_backup.tar` and update it's hash - it WON'T be accepted  as valid anymore.
 
-However `recovery` (which is where the real update occurs) still has a flaw, so there's a trick using two USB drives:
+However `recovery` (which is where the real update occurs) still has a flaw (does not check if signed hashes match real hashes), so there's a trick using two USB drives:
 - In the first USB drive you copy the official firmware update (where `sw_backup.tar` matches the RSA-signed hashlist)
 - In the the second one you put the patched firmware (with the recalculated hash for `sw_backup.tar`).  
   No need to create a new RSA signature (we wouldn't be able to do it anyway)
@@ -200,30 +208,29 @@ Edit `run.sh` in your USB drive and replace it with the following:
   # Redirecting output to append to the file
   LOG_FILE="/storage/usb0/bash_log.txt"
   exec 1>"$LOG_FILE" 2>&1
+  export PATH=/sbin:/vendor/bin:/system/sbin:/system/bin:/system/xbin
 
-  # COMMANDS
-  echo "Copying recovery resources..." # this zip contains AES key and iv
-  /system/bin/cp /system/etc/recovery-resource.dat /storage/usb0/recovery-resource.zip
-  
-  echo "Copying key/iv individually (if they exist)..."
-  /system/bin/cp /system/etc/image*.dat /storage/usb0/
-  /system/bin/cp /system/etc/iv*.dat /storage/usb0/
+  # this zip contains AES key and iv
+  echo "Copying recovery resources..."
+  cp /system/etc/recovery-resource.dat /storage/usb0/recovery-resource.zip
+  # same files can be found under /system/etc/image.dat and (in some HUs) /system/etc/iv.dat
+  # but those can't be read by this non-privileged exploit account
 
-  echo "Pushing some utilities to the HU..." # copying to any writeable folder
-  /system/bin/cp /storage/usb0/tc-write-misc /storage/navi/bin
-  /system/bin/chmod 777 /storage/navi/bin/tc-write-misc 
+  # copying this utility to any writeable folder
+  # if this folder doesn't exist just ignore it
+  echo "Pushing some utilities to the HU..."
+  cp /storage/usb0/tc-write-misc /data/local/tmp
+  chmod 777 /data/local/tmp/tc-write-misc 
 
-  echo "backing-up boot.img..."
-  /system/bin/dd if=/dev/block/platform/bdm/by-name/boot of=/storage/usb0/boot-backup.img
    ```
 
 Plug that USB into your HU, and launch the navigator app (which may or may not start - don't worry, we can fix it later).  
 
-Remove your USB drive and check if some files were copied there, as well as logs, and a lock file `XXlock`.
+Remove your USB drive and check if you can see recover-resource.zip, as well as logs, and a lock file `XXlock`.
 
-If everything worked fine, save those files (you'll need them later), and we can proceed with more tricks...
+If everything worked fine, save recover-resource.zip (you'll need them later), and we can proceed with more tricks...
 
-PS: Those files copied from HU to USB (`/system/etc/image.dat`, `/system/etc/iv.dat` if exists and `/system/etc/recovery-resource.dat`) are the AES key that can be used to decrypt all other firmware parts (other than navigation)
+PS: Inside recover-resource.zip you'll find the AES key that can be used to decrypt all other firmware parts (other than navigation), which can also be found under `/system/etc/image.dat`. Some units also have IV (initialiaztion vector) under `/system/etc/iv.dat`.
 
 ## Enabling ADB
 
@@ -234,10 +241,11 @@ Delete `XXlock`, edit `run.sh` and replace with the following commands:
 
   LOG_FILE="/storage/usb0/bash_log.txt"
   exec 1>"$LOG_FILE" 2>&1
+  export PATH=/sbin:/vendor/bin:/system/sbin:/system/bin:/system/xbin
 
   # COMMANDS
   echo "Enabling adb..."
-  service call com.hkmc.misc 6 i32 5 # enables adb mode (usb drives wont work, android auto wont work)
+  service call com.hkmc.misc 6 i32 5 # enable adb mode (usb drives wont work, android auto wont work)
   service call com.hkmc.misc 4 i32 4 # restart adb
   
   # as soon as we enable adb the USB drive will disconnect, 
@@ -247,7 +255,9 @@ Delete `XXlock`, edit `run.sh` and replace with the following commands:
 Launch navigator again. Remove USB drive and check for logs (no worry if it's empty) and for a new lockfile `XXLock`.  
 If they are not there it means the hook didn't run - in this case reset the HU and try again (sometimes navi/lock freezes so you need to reboot)
 
-If everything worked fine, you should be able to plug your Laptop and run `adb devices` and see the HU
+If everything worked fine, you should be able to plug your Laptop and run `adb devices` and see the HU.
+
+When you enable ADB your USB will get immediately disconnected, which means that this time `bash_log.txt` will be empty.
 
 ## ADB
 
@@ -294,11 +304,11 @@ In both cases you will need the stock `boot.img`.
 
 ## Dumping boot.img from Android HU
 
-Earlier in the initial script I told you to run this command:
+Using an adb shell you should be able to make a backup of your current boot partition:
 ```sh
 /system/bin/dd if=/dev/block/platform/bdm/by-name/boot of=/storage/usb0/boot-backup.img
 ```
-If this worked you should have now a dump of your current boot.img in your USB drive.
+If this works you should get a dump of your current boot.img in your USB drive. If it doesn't work it's ok (see next section).
 
 ## Decrypt boot.img
 
@@ -319,26 +329,20 @@ In order to decrypt `enc_boot.img` (or any other img) you should run this:
 # Get the first 32 characters of image.dat - that's the AES key for your model
 AESKEY="32-char-hex-string" 
 
-# Initialization vector is the same for all firmware versions/geos (unless you have a file named iv.dat)
+# Initialization vector is the same for all firmware versions/geos (it's just 00 01 02 03 ...etc)
+# (unless rare cases where you should find it in a file /system/etc/iv.dat)
 IV="000102030405060708090A0B0C0D0E0F"
 
 # Decrypt files like this:
 openssl aes-128-cbc -K $AESKEY -iv $IV -d -in ./enc_system/enc_boot.img -out ./system/boot.img
-# or...
-#openssl aes-128-cbc -K $AESKEY -iv $IV -d -in ./enc_system/enc_system.ext4 -out ./system/system.ext4
-#... etc
 ```
+
 
 AES does not have any way to validate if the secret was correct (sometimes wrong keys will crash but sometimes it will just decrypt into bad results), so you should validate the results:
 - Open `boot.img` in a text editor
-- Check if it starts with "ANDROID" (this means the key was correct)
-- Check if right in the first line you can read `androidboot.selinux=disabled` among other readable strings.  
-  (This means that IV is also correct. AES-CBC will [correctly decrypt the first block](https://security.stackexchange.com/questions/207633/decrypting-aes-128-cbc-leads-to-first-block-being-correct-the-rest-corrupt) even with the wrong IV).
+- If `AESKEY` and `IV` are corect then the first few bytes should be `ANDROID` and a little later (still in the first line) you should be see `androidboot.selinux=disabled` among other readable strings.  
+- You can double-check the decryption by calculating the hash of the decrypted file (like `python3 ~/gen5w-utils/sha224_gen.py boot.img`) and comparing it with the hash you'll find in `update.info`
 
-
-## Decrypt system.ext4, recovery.img, etc.
-
-Same as previous
 
 
 ## Patch boot.img to get Permanent Root
@@ -355,7 +359,7 @@ git clone https://github.com/ndrancs/AIK-Linux-x32-x64
 cd ~/AIK-Linux-x32-x64
 chmod +x *.sh
 
-# Unpack boot.img - the kernel will be unpacked into ./zImage, and the temp filesystem unpacked into ./ramdisk :
+# Unpack boot.img - the kernel will be unpacked into ./split_img, and the temp filesystem unpacked into ./ramdisk :
 sudo ./unpackimg.sh ./system/boot.img # unpackimg should be executed
 
 # Now edit (in any Linux editor!!!) ramdisk/default.prop, make the following changes:
@@ -363,8 +367,8 @@ sudo ./unpackimg.sh ./system/boot.img # unpackimg should be executed
 # change ro.secure     from 1 to 0
 
 # Now replace ./ramdisk/sbin/adbd with the adbd attached
-# This patched adb daemon gives root privilege and allows "adb remount" command
-# ("adb remount" enables you to "adb push" into a read-only folder after you remount it with "mount -o rw, remount /")
+# This patched adb daemon gives allows "adb remount" and "adb root"
+# ("adb remount" remounts /system as writeable, enabling you to "adb push" into it, it's equivalent to "mount -o rw,remount /system")
 
 # Now repack ramdrive+kernel - they will be packed into a new file ./image-new.img :
 sudo ./repackimg.sh
@@ -395,7 +399,7 @@ This is how you can enter bootloader mode:
 Open an `adb shell` and run this:
 ```sh
 # let's schedule that subsequent boots should be in bootloader (fastboot mode)
-/storage/navi/bin/tc-write-misc boot-bootloader
+/data/local/tmp/tc-write-misc boot-bootloader
 # reboot
 /system/bin/reboot
 ```
@@ -423,7 +427,7 @@ Boot ONCE into the full Android to see if it works (but don't clear yet the boot
 **If Android loads fine**, set the device to reboot subsequent boots into full Android:
 ```sh
 # let's QUIT bootloader (schedule that subsequent boots should be back in regular Android OS)
-/storage/navi/bin/tc-write-misc boot-normal
+/data/local/tmp/tc-write-misc boot-normal
 # reboot
 /system/bin/reboot
 ```
@@ -437,15 +441,13 @@ Now that we have root open `adb shell` and run this:
 
 ```sh
 # Make filesystem writeable (this is not permanent, clears every boot):
-mount -o rw, remount /
+mount -o rw,remount /
 
 # this file is what makes adb hidden from engineering mode
 rm -f /system/etc/permissions/com.hkmc.software.engineermode.adb_hide.xml
 ```
 
-After deleting `com.hkmc.software.engineermode.adb_hide.xml` now when you go to **engineering mode** you can go to modules menu, navigate to the 3rd page, and click 5 times in the bottom-right corner - then you'll see the adb tab appears on your left - so now you can enable and disable adb directly from UI.
-
-The command `mount -o rw, remount /` should be executed inside Android and will remount the whole filesystem as writeable. After that command you can also push files to protected folders using `adb push` - but you have to first call `adb remount`.
+PS: `adb remount` (available in the patched `adbd` that you have in `boot-patched.img`) will [remount `/system` as writeable](https://stackoverflow.com/questions/28961572/what-does-adb-remount-do-when-is-it-useful) so you can `adb push` to it.
 
 ## Alternative (only for TCC897X chipset): ClockWorkMod to get Temporary Root
 
@@ -472,11 +474,14 @@ Please note that some of the adb options used above (`adb reboot bootloader` to 
 To sum: with the CWM solution you can TEMPORARILY get root, and unhide adb, but after reverting back to stock boot you'll still have most of the folders as read-only (e.g. you can't easily modify an APK, you would have to flash CWM again).
 So to avoid having to flash CWM again it might be helpful to run `chmod 777 -R /system/app` to be able to modify apks.
 
+## Enabling/Disabling ADB directly from UI
+
+After deleting `com.hkmc.software.engineermode.adb_hide.xml` now when you go to **engineering mode** you can go to modules menu, navigate to the 3rd page, and click 5 times in the bottom-right corner - then you'll see the adb tab appears on your left - so now you can enable and disable adb directly from UI.
 
 ## Reverting the Patch from Navi Libraries
 
-After you unhide ADB you won't need anymore the service calls (you can enable adb from menus) and you might not need anymore the navi/runsh exploit (because you have adb shell).
-
+After unhiding adb you can enable/disable it from the UI, and you can run any commands directly from `adb shell`.
+So you won't need the navi/`run.sh` exploit (or the `service call`) to run commands or enable/disable adb.  
 So if your navi was broken (or got slower) after the exploit you can revert the exploited libs, restoring them from the stock `sw_backup.tar`:
 
 - Extract file `navi_backup\BIN\G45\enc_libExSLAndroidJNI.so` from `sw_backup.tar`
@@ -549,10 +554,76 @@ Then you should see Wi-Fi in the UI settings. If you don't you can open Wi-Fi se
 If you want to play with Modem settings:  
 `adb shell am start --user 0 -n com.hkmc.system.app.modem.engineering/com.hkmc.system.app.modem.engineering.ModemEngineerModeActivity`
 
+# Advanced
+
 ## Car CAN Bus/Micom
 
 Haven't explored this yet, but looks fun:  
 https://programmingwithstyle.com/posts/howihackedmycarpart4/
+
+## Decompile (deodex/baksmali) APK
+
+First install Smali(/Baksmali):
+
+```sh
+================= Install Smali (Smali/Baksmali) =================
+cd ~
+git clone https://github.com/JesusFreke/smali.git
+cd smali # ~/smali
+gradle
+gradle build
+
+cd util # ~/smali/util
+gradle build
+cd ../smali # ~/smali/smali
+gradle build
+cd ../baksmali # ~/smali/baksmali
+gradle build
+# if I remember correctly I had to add write permissions here. e.g. # sudo chmod a+rw -R .
+
+cd ../scripts # ~/smali/scripts
+cp ../baksmali/build/libs/baksmali.jar .
+
+# Add ~/smali/scripts to path
+pico ~/.bashrc
+export PATH="~/smali/scripts:$PATH"
+source ~/.bashrc
+```
+
+# Put your ODEX file in a path where you have write permissions 
+# and which does not contain any spaces (or else the next commands will fail)
+
+```sh
+# Deodex
+python3 ~/gen5w-utils/odex_to_dex.py -s ./ ./app/Launcher_WP3.odex
+
+# Extract smali classes
+baksmali d ./app/Launcher_WP3.dex -o  ./app/Launcher_WP3-smali
+```
+
+
+## Decrypt/extract system.ext4, decrypt/unpack recovery.img, etc.
+
+All encrypted files can be decrypted exactly like we did for `boot.img`:
+```sh
+openssl aes-128-cbc -K $AESKEY -iv $IV -d -in ./enc_system/enc_boot.img        -out ./system/boot.img
+openssl aes-128-cbc -K $AESKEY -iv $IV -d -in ./enc_system/enc_recovery.img    -out ./system/recovery.img
+openssl aes-128-cbc -K $AESKEY -iv $IV -d -in ./enc_system/enc_splash.img      -out ./system/splash.img
+openssl aes-128-cbc -K $AESKEY -iv $IV -d -in ./enc_system/enc_lk.rom          -out ./system/lk.rom
+openssl aes-128-cbc -K $AESKEY -iv $IV -d -in ./enc_system/enc_device_tree.dtb -out ./system/device_tree.dtb
+openssl aes-128-cbc -K $AESKEY -iv $IV -d -in ./enc_system/enc_system.ext4     -out ./system/system.ext4
+```
+
+How to mount (in-memory) `system.ext4`:
+
+```sh
+mkdir ./system_in_memory
+sudo mount -o ro,noload ./system/system.ext4 ./system_in_memory
+# you may want to copy all contents (or at least copy /app and maybe /framework)
+# mkdir ./system_extracted
+# sudo cp -R ./system_in_memory/* ./system_extracted
+```
+
 
 <!--
 ## Wireless Carplay
@@ -578,8 +649,10 @@ init files, `uagentd`, `/sbin/adbd`
 ## Protecting Against OTA Updates
 
 ## Protecting Against Dealer Updates
+- Change Eng Mode password
+- First enable adb, then reboot, then move old APK and send new one, only then launch it... if doesn't work you can still revert it
 - Shortcut to eng mode
-- adb enable/disable
+- shortcuts to adb enable/disable
 -->
 
 
